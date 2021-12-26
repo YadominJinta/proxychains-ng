@@ -83,7 +83,10 @@ pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 static int init_l = 0;
 
+static int getting_chain_data = 0;
+
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
+
 
 static void* load_sym(char* symname, void* proxyfunc) {
 
@@ -128,13 +131,15 @@ static void do_init(void) {
 	srand(get_rand_seed());
 	core_initialize();
 
+	setup_hooks();
+
 	/* read the config file */
+	getting_chain_data = 1;
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
 	DUMP_PROXY_CHAIN(proxychains_pd, proxychains_proxy_count);
+	getting_chain_data = 0;
 
 	proxychains_write_log(LOG_PREFIX "DLL init: proxychains-ng %s\n", proxychains_get_version());
-
-	setup_hooks();
 
 	while(close_fds_cnt) true_close(close_fds[--close_fds_cnt]);
 	init_l = 1;
@@ -332,14 +337,41 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 				pd[count].port = htons((unsigned short) port_n);
 				ip_type* host_ip = &pd[count].ip;
 				if(1 != inet_pton(host_ip->is_v6 ? AF_INET6 : AF_INET, host, host_ip->addr.v6)) {
-					if(*ct == STRICT_TYPE && proxychains_resolver >= DNSLF_RDNS_START && count > 0) {
+					if(*ct == STRICT_TYPE && proxychains_resolver >= DNSLF_RDNS_START) {
 						/* we can allow dns hostnames for all but the first proxy in the list if chaintype is strict, as remote lookup can be done */
-						rdns_init(proxychains_resolver);
-						ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
-						pd[count].ip.is_v6 = 0;
-						host_ip->addr.v4 = internal_ip;
-						if(internal_ip.as_int == IPT4_INVALID.as_int)
-							goto inv_host;
+						if (count > 0) {
+							rdns_init(proxychains_resolver);
+							ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
+							pd[count].ip.is_v6 = 0;
+							host_ip->addr.v4 = internal_ip;
+							if(internal_ip.as_int == IPT4_INVALID.as_int)
+								goto inv_host;
+						} else {
+							struct addrinfo* addr;
+							int result = true_getaddrinfo(host, NULL, NULL, &addr);
+							if (result != 0) {
+								goto inv_host;
+							}
+							for (struct addrinfo* res = addr; res != NULL; res = res->ai_next) {
+								int af = res->ai_family;;
+								struct sockaddr *addr = res->ai_addr;
+								switch (af)
+								{
+								case AF_INET:
+									pd[count].ip.is_v6 = 0;
+									host_ip->addr.v4 = IPT4_INT(((struct sockaddr_in*) addr)->sin_addr.s_addr);
+									break;
+								case AF_INET6:
+									pd[count].ip.is_v6 = 1;
+									memcpy(host_ip->addr.v6, ((struct sockaddr_in6*) addr)->sin6_addr.s6_addr, 16);
+									break;
+								}
+							}
+get_host:
+							if (!host_ip->is_v6 && host_ip->addr.v4.as_int == IPT4_INVALID.as_int) {
+								goto inv_host;
+							}
+						}
 					} else {
 inv_host:
 						fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
@@ -554,6 +586,9 @@ static int is_v4inv6(const struct in6_addr *a) {
 }
 
 HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) {
+	if (getting_chain_data) {
+		return true_connect(sock, addr, len);
+	}
 	INIT();
 	PFUNC();
 
